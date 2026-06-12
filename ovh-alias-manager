@@ -1,0 +1,11 @@
+#!/bin/sh
+# Copyright (C) 2026 Stuart Pook
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -xe
+cd "${0%/*}"
+readonly script=ovh-alias-manager.py
+python3 -m py_compile $script
+mypy --check-untyped-defs --warn-no-return $script
+python3 -m flake8 --max-line-length=120 $script
+
+exec ./$script "$@"

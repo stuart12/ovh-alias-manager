@@ -1,0 +1,6 @@
+#!/bin/sh -ex
+
+python3 -m py_compile sync_aliases.py
+mypy  --check-untyped-defs --warn-no-return sync_aliases.py
+python3 -m flake8 --max-line-length=120 sync_aliases.py
+exec podman build -t ovh-syncer -f Containerfile .
