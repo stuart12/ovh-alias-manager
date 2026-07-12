@@ -20,15 +20,19 @@ import collections
 
 logger = logging.getLogger(pathlib.Path(__file__).stem)
 
+from enum import Enum
 
-def set_logging_level(loglevel: int) -> None:
-    script_name = pathlib.Path(sys.argv[0]).name
-    logging.basicConfig(
-        level=logging.WARNING,
-        format=f"{script_name}:%(levelname)s:%(name)s:%(message)s",
-        force=True,
-    )
-    logger.setLevel(loglevel)
+class Action(Enum):
+    KNOWN = ('known', 'print all known aliases')
+    USED = ('used', 'print all used aliases')
+    UNALIASED = ('unaliased', 'print all unaliased aliases')
+    CREATE = ('create', 'create an alias')
+    def __new__(cls, cli_name: str, help_text: str):
+        obj = object.__new__(cls)
+        obj._value_ = cli_name
+        obj.cli_name = cli_name
+        obj.help_text = help_text
+        return obj
 
 
 class AppConfig(typing.TypedDict):
@@ -262,9 +266,9 @@ def write_cache(cache: AliasCache, cache_path: pathlib.Path) -> None:
     logger.info("wrote %d cache entries to %s", len(cache), LazyQuote(cache_path))
 
 
-def print_entries(aliases: dict[str, list[str]], prefix: str = '') -> None:
+def print_entries(aliases: dict[str, list[str]], domain:str, prefix: str = '') -> None:
     for known, passwords in aliases.items():
-        print(prefix, shlex.quote(known), ' ', shlex.join(passwords), sep='')
+        print(prefix, shlex.quote(known), '@', domain, ' ', shlex.join(passwords), sep='')
 
 
 def create_entry(
@@ -316,11 +320,16 @@ def get_summaries(cache: AliasCache) -> tuple[dict[str, list[str]], dict[str, li
     return used, unalias
 
 
-def run_sync(local_parts: collections.abc.KeysView[str], cfg_file: pathlib.Path) -> None:
-    cfg_filename = cfg_file.as_posix()
-    if ',' in cfg_filename:
-        logger.critical("error: the configuration filename contains a comma: %s", LazyQuote(cfg_filename))
-        sys.exit(98)
+def make_mount_argument(source: pathlib.Path, target: str) -> str:
+    quotes_doubled = source.resolve().as_posix().replace('"', '""')
+    return f'--mount=type=bind,"source={quotes_doubled}",target={target},readonly'
+
+
+def run_sync(
+        local_parts: collections.abc.KeysView[str], image_name: str, container_script: pathlib.Path,
+        cfg_file: pathlib.Path) -> None:
+    cfg_handle = open(cfg_file, 'r')
+    os.set_inheritable(cfg_handle.fileno(), True)
     with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as f:
         count = 0
         for local_part in local_parts:
@@ -328,24 +337,39 @@ def run_sync(local_parts: collections.abc.KeysView[str], cfg_file: pathlib.Path)
             count += 1
         f.seek(0)
         os.dup2(f.fileno(), sys.stdin.fileno())
-        os.set_inheritable(sys.stdin.fileno(), True)
-        mount_point = '/app/config.json'
+        script_in_container = '/app/sync-aliases'
         cmd = 'podman'
+        tmpfs_opts = ':size=16M,noexec,nosuid,nodev'
         arguments = [
-            cmd, 'run', '--interactive', '--rm',
-            f"--mount=type=bind,target={mount_point},readonly,source={cfg_filename}",
-            'ovh-syncer', f"--config={mount_point}", f"--count={count}", f"--loglevel={logger.getEffectiveLevel()}",
+            cmd, 'run',
+            '--interactive',
+            '--rm',
+            '--pull=never',
+            '--read-only',
+            f"--tmpfs=/tmp{tmpfs_opts}",
+            f"--tmpfs=/var/tmp{tmpfs_opts}",
+            '--cap-drop=ALL',
+            '--security-opt=no-new-privileges',
+            '--user=65534:65534',
+            make_mount_argument(source=container_script, target=script_in_container),
+            f"--preserve-fd={cfg_handle.fileno()}",
+            image_name,
+            script_in_container,
+            f"--config=/dev/fd/{cfg_handle.fileno()}",
+            f"--count={count}",
+            f"--loglevel={logger.getEffectiveLevel()}",
         ]
-        logger.debug("running: %s", shlex.join(arguments))
+        sys.stdout.flush()
+        os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+        logger.debug("exec'ing: %s", shlex.join(arguments))
         os.execvp(cmd, arguments)
     logger.critical("execvp of %s failed", LazyQuote(cmd))
     sys.exit(6)
 
 
 def run_manage(
-        cfg_file: pathlib.Path, print_known: bool, print_used: bool, create_alias: bool,
-        print_unaliased: bool,
-        cache_path: pathlib.Path) -> None:
+        cfg_file: pathlib.Path,
+        image_name: str, container_script: pathlib.Path, action: Action, cache_path: pathlib.Path) -> None:
     cfg = load_config(cfg_file)
     ignored_dirs = cfg['ignored_dirs']
     unalias_tag = cfg['unalias']
@@ -360,63 +384,124 @@ def run_manage(
     if cache != original_cache:
         write_cache(cache=cache, cache_path=cache_path)
     used, unalias = get_summaries(cache)
-    if print_known:
-        print_entries(used, prefix='+ ')
-        print_entries(unalias, prefix='- ')
-        return
-    if print_used:
-        print_entries(used)
-        return
-    if print_unaliased:
-        print_entries(unalias)
-        return
-    if create_alias:
-        create_entry(
-            cache=cache, cache_path=cache_path, used=used, unaliased=unalias,
-            domain=domain, prefix=prefix, pass_store=pass_store)
-    run_sync(local_parts=used.keys(), cfg_file=cfg_file)
+    match action:
+        case Action.KNOWN:
+            print_entries(used, prefix='+ ', domain=domain)
+            print_entries(unalias, prefix='- ', domain=domain)
+        case Action.USED:
+            print_entries(used, domain=domain)
+        case Action.UNALIASED:
+            print_entries(unalias, domain=domain)
+        case Action.CREATE:
+            create_entry(
+                cache=cache, cache_path=cache_path, used=used, unaliased=unalias,
+                domain=domain, prefix=prefix, pass_store=pass_store)
+    run_sync(
+        local_parts=used.keys(),
+        cfg_file=cfg_file, image_name=image_name, container_script=container_script)
 
 
-def manage() -> None:
+def loglevel_type(value: str) -> int:
+    """
+    Smart type handler for argparse. Accepts names ('INFO', 'debug') or raw integers ('20').
+    """
+    if value.isdigit():
+        return int(value)
+    mapping = logging.getLevelNamesMapping()
+    name = value.upper()
+    if name in mapping:
+        return mapping[name]
+    raise argparse.ArgumentTypeError(f"Invalid log level: {value}")
+
+
+def add_loglevel_arguments(parser: argparse.ArgumentParser, default_level: int=logging.WARNING) -> None:
+    parser.set_defaults(loglevel=default_level)
+    target_levels = [
+        logging.DEBUG,
+        logging.INFO,
+        logging.WARNING,
+        logging.ERROR,
+        logging.CRITICAL,
+    ]
+    for level_int in target_levels:
+        name = logging.getLevelName(level_int)
+        aliases = [f"--{name.lower()}"]
+
+        if level_int == logging.DEBUG:
+            aliases.extend(['-v', '--verbose'])
+        elif level_int == logging.CRITICAL:
+            aliases.append('--quiet')
+
+        parser.add_argument(
+            *aliases,
+            dest='loglevel',
+            action='store_const',
+            const=level_int,
+            help=f"Set log level to {name}"
+        )
+    parser.add_argument(
+        '--loglevel',
+        dest='loglevel',
+        type=loglevel_type,
+        help='Set log level by name (e.g., DEBUG) or integer (e.g., 10)'
+    )
+
+
+def set_logging_level(options: argparse.Namespace) -> None:
+    script_name = pathlib.Path(sys.argv[0]).name
+    logging.basicConfig(
+        level=logging.WARNING,
+        format=f"{script_name}:%(levelname)s:%(name)s:%(message)s",
+        force=True
+    )
+    logger.setLevel(options.loglevel)
+
+
+def add_loglevel_options_parse_and_bootstrap_logging(
+        parser: argparse.ArgumentParser) -> argparse.Namespace:
+    add_loglevel_arguments(parser)
+    options = parser.parse_args()
+    set_logging_level(options)
+    return options
+
+
+def manage(script: pathlib.Path) -> None:
     program_name = 'ovh-alias-manager'
     parser = argparse.ArgumentParser(
         description='Sync email aliases from password files to OVH',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument(
         '--config', type=pathlib.Path, help='Path to config',
-        default=pathlib.Path('~') / '.config' / program_name / 'config.json')
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('-v', '--verbose', '--debug', action='store_true', help='Set level to DEBUG')
-    group.add_argument("-q", "--quiet", action="store_true", help="Set level to WARNING")
-    group.add_argument(
-        "-l", "--level", help="Set explicit console logging level",
-        choices=["debug", "info", "warning", "error", "critical"])
-    function = parser.add_mutually_exclusive_group()
-    function.add_argument('--known', action='store_true', help='print all known aliases')
-    function.add_argument('--used', action="store_true", help='print all used aliases')
-    function.add_argument('--unaliased', action="store_true", help='print all unaliased aliases')
-    function.add_argument('-c', '--create', action="store_true", help='create a new alias')
-
+        default=pathlib.Path('~').expanduser() / '.config' / program_name / 'config.json')
     parser.add_argument(
-        '--alias-cache', type=pathlib.Path, help='cache of email alias',
-        default=pathlib.Path('~') / '.cache' / program_name)
+        '--container-script',
+        type=pathlib.Path, default=script.parent / 'sync_aliases.py', help='script to run in the container')
+    parser.add_argument(
+        '--image-name', type=str, help='podman image with ovh Python module',
+        default=f"localhost/{program_name}:latest")
+    parser.add_argument(
+        '--alias-cache', type=pathlib.Path, help='cache of email aliases',
+        default=pathlib.Path('~').expanduser() / '.cache' / program_name)
 
-    args = parser.parse_args()
-    if args.level:
-        log_level = getattr(logging, args.level.upper())
-    elif args.verbose:
-        log_level = logging.DEBUG
-    elif args.quiet:
-        log_level = logging.WARNING
-    else:
-        log_level = logging.INFO
-    set_logging_level(log_level)
+    parser.set_defaults(action=Action.USED)
+    function = parser.add_mutually_exclusive_group()
+    for action in Action:
+        function.add_argument(
+            f"--{action.cli_name}",
+            dest='action',
+            action='store_const',
+            const=action,
+            help=action.help_text
+        )
+
+    args = add_loglevel_options_parse_and_bootstrap_logging(parser)
 
     run_manage(
-        print_known=args.known, cfg_file=args.config.expanduser(),
-        print_used=args.used, print_unaliased=args.unaliased, create_alias=args.create,
-        cache_path=args.alias_cache.expanduser())
+        cfg_file=args.config,
+        cache_path=args.alias_cache, container_script=args.container_script,
+        image_name=args.image_name, action=args.action,
+    )
 
 
 if __name__ == "__main__":
-    manage()
+    manage(pathlib.Path(__file__))
