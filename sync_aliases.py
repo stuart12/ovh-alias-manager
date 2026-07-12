@@ -12,6 +12,7 @@ import pathlib
 import shlex
 import typing
 import re
+import os
 
 logger = logging.getLogger(pathlib.Path(__file__).stem)
 
@@ -119,13 +120,19 @@ class OvhClient:
 
 
 def load_config(config_path: pathlib.Path) -> AppConfig:
-    try:
-        with open(config_path, 'r') as f:
-            cfg = json.load(f)
-    except FileNotFoundError as ex:
-        logger.critical("Config file %s not found: %s", LazyQuote(config_path), ex)
-        sys.exit(2)
-    return typing.cast(AppConfig, cfg)
+    path_str = config_path.as_posix()
+    fd_prefix = '/dev/fd/'
+    if path_str.startswith(fd_prefix):
+        fd_number = int(path_str[len(fd_prefix):])
+        f = os.fdopen(fd_number, 'r')
+    else:
+        try:
+            f = open(config_path, 'r')
+        except FileNotFoundError as ex:
+            logger.critical("Config file %s not found: %s", LazyQuote(config_path), ex)
+            sys.exit(2)
+    with f:
+        return typing.cast(AppConfig, json.load(f))
 
 
 def _validate_suffix(word: str, minimum_length: int, maximum_length: int) -> str:
